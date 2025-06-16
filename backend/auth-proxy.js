@@ -4,8 +4,11 @@ const fs = require('fs');
 const path = require('path');
 const jwt = require('jsonwebtoken');
 const { spawn } = require('child_process');
+const { PrismaClient } = require('@prisma/client');
+const bcrypt = require('bcryptjs');
 
 const app = express();
+const prisma = new PrismaClient();
 
 // Конфигурация из переменных окружения с fallback значениями
 const PORT = process.env.BACKEND_PORT || 8080;
@@ -19,7 +22,7 @@ const RTSP_PASS = process.env.RTSP_PASS || 'admin123';
 
 // API ключ для интеграции между сервисами
 const VALID_API_KEYS = [
-    process.env.API_KEY || 'askr-api-key-2025'
+    process.env.API_ACCESS_KEY || 'askr-api-key-2025'
 ];
 
 // Создаем необходимые директории
@@ -32,62 +35,6 @@ const VALID_API_KEYS = [
 
 // Храним активные процессы записи
 const activeRecordings = new Map();
-
-// База данных пользователей (упрощенная, в памяти)
-const USERS_DB = {
-    'admin': {
-        id: 1,
-        username: 'admin',
-        password: 'admin123',
-        role: 'admin',
-        cameras: Array.from({length: 24}, (_, i) => i + 1) // доступ ко всем камерам
-    },
-    'operator': {
-        id: 2,
-        username: 'operator',
-        password: 'op123',
-        role: 'operator',
-        cameras: Array.from({length: 24}, (_, i) => i + 1) // доступ ко всем камерам
-    },
-    'user1': {
-        id: 3,
-        username: 'user1',
-        password: 'user123',
-        role: 'user',
-        cameras: [1, 2, 3, 4, 5, 6] // первые 6 камер
-    },
-    'user2': {
-        id: 4,
-        username: 'user2',
-        password: 'user456',
-        role: 'user',
-        cameras: [7, 8, 9, 10, 11, 12] // следующие 6 камер
-    },
-    'user3': {
-        id: 5,
-        username: 'user3',
-        password: 'user789',
-        role: 'user',
-        cameras: [13, 14, 15, 16, 17, 18] // следующие 6 камер
-    },
-    'user4': {
-        id: 6,
-        username: 'user4',
-        password: 'user999',
-        role: 'user',
-        cameras: [19, 20, 21, 22, 23, 24] // последние 6 камер
-    }
-};
-
-// База данных камер (упрощенная)
-const CAMERAS_DB = Array.from({length: 24}, (_, i) => ({
-    id: i + 1,
-    channelId: i + 1,
-    name: `Камера ${i + 1}`,
-    position: i + 1,
-    isActive: true,
-    rtspUrl: `rtsp://${RTSP_USER}:${RTSP_PASS}@${RTSP_BASE_IP}:${RTSP_PORT}/chID=${i + 1}1`
-}));
 
 // Middleware
 app.use(express.json());
@@ -145,83 +92,198 @@ const verifyApiKey = (req, res, next) => {
 };
 
 // Проверка доступа к камере
-const checkCameraAccess = (req, res, next) => {
+const checkCameraAccess = async (req, res, next) => {
     const cameraId = parseInt(req.params.cameraId);
-    const userCameras = req.user.cameras || [];
     
-    if (req.user.role === 'admin') {
-        return next();
-    }
-    
-    if (!userCameras.includes(cameraId)) {
-        return res.status(403).json({ 
-            error: 'Access denied to this camera',
-            camera: cameraId,
-            allowed_cameras: userCameras
+    try {
+        if (req.user.role === 'ADMIN') {
+            return next();
+        }
+        
+        // Проверяем права доступа через Prisma
+        const permission = await prisma.userCameraPermission.findFirst({
+            where: {
+                userId: req.user.userId,
+                camera: {
+                    channelId: cameraId
+                },
+                canView: true
+            }
         });
+        
+        if (!permission) {
+            return res.status(403).json({ 
+                error: 'Access denied to this camera',
+                camera: cameraId
+            });
+        }
+        
+        next();
+    } catch (error) {
+        console.error('Error checking camera access:', error);
+        res.status(500).json({ error: 'Failed to check camera access' });
     }
-    
-    next();
 };
 
 // Проверка токена для сегментов
 const verifySegmentToken = (req, res, next) => {
-    const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
+    const token = req.query.token;
     
     if (!token) {
-        return res.status(401).json({ error: 'Segment access denied: token required' });
+        return res.status(401).json({ error: 'Token required for stream access' });
     }
     
     try {
         const decoded = jwt.verify(token, JWT_SECRET);
-        const cameraId = parseInt(req.params.cameraId);
+        req.user = decoded;
         
-        // Админы имеют доступ ко всем камерам
-        if (decoded.role === 'admin') {
-            req.user = decoded;
-            return next();
+        // Дополнительно проверяем тип токена
+        if (decoded.type !== 'stream') {
+            return res.status(403).json({ error: 'Invalid token type for streaming' });
         }
         
-        // Проверяем доступ к конкретной камере
-        if (decoded.cameras && decoded.cameras.includes(cameraId)) {
-            req.user = decoded;
-            return next();
-        }
-        
-        // Токены для конкретного стрима
-        if (decoded.type === 'stream' && decoded.channelId === cameraId) {
-            req.user = decoded;
-            return next();
-        }
-        
-        return res.status(403).json({ error: 'Segment access denied: insufficient permissions' });
-        
+        next();
     } catch (error) {
-        return res.status(401).json({ error: 'Segment access denied: invalid token' });
+        return res.status(401).json({ error: 'Invalid stream token' });
     }
 };
 
 // ===============================
-// API ENDPOINTS ДЛЯ ИНТЕГРАЦИИ
+// ОСНОВНЫЕ ЭНДПОИНТЫ
 // ===============================
 
-// Список камер для основного API
-app.get('/api/cameras/list', verifyApiKey, (req, res) => {
+// Статус сервера
+app.get('/status', (req, res) => {
+    res.json({
+        status: 'running',
+        timestamp: new Date().toISOString(),
+        hls_dir: HLS_DIR,
+        recordings_dir: RECORDINGS_DIR,
+        active_recordings: activeRecordings.size
+    });
+});
+
+// ===============================
+// АУТЕНТИФИКАЦИЯ ЧЕРЕЗ PRISMA
+// ===============================
+
+// Получение токена
+app.post('/auth/token', async (req, res) => {
+    const { username, password } = req.body;
+    
+    if (!username || password === undefined) {
+        return res.status(400).json({ error: 'Username and password required' });
+    }
+    
     try {
-        const camerasWithStatus = CAMERAS_DB.map(camera => {
-            // Проверяем статус камеры по наличию HLS файлов
-            const hlsFile = path.join(HLS_DIR, `camera_${camera.channelId}.m3u8`);
-            const adaptiveDir = path.join(HLS_DIR, `camera_${camera.channelId}`);
-            const masterPlaylist = path.join(adaptiveDir, 'master.m3u8');
+        // Для совместимости с существующей системой, проверяем хардкод пароли
+        const hardcodedUsers = {
+            'admin': 'admin123',
+            'operator': 'op123', 
+            'user1': 'user123',
+            'user2': 'user456',
+            'user3': 'user789',
+            'user4': 'user999'
+        };
+        
+        // Проверяем хардкод пароль ИЛИ ищем в БД
+        let user = null;
+        let isValidPassword = false;
+        
+        if (hardcodedUsers[username] && hardcodedUsers[username] === password) {
+            // Находим пользователя в БД
+            user = await prisma.user.findUnique({
+                where: { username },
+                include: {
+                    permissions: {
+                        include: {
+                            camera: true
+                        }
+                    }
+                }
+            });
+            isValidPassword = true;
+        }
+        
+        if (!user || !isValidPassword) {
+            return res.status(401).json({ error: 'Invalid credentials' });
+        }
+        
+        // Получаем список камер для пользователя
+        const userCameras = user.permissions.map(p => p.camera.channelId);
+        
+        const token = jwt.sign(
+            { 
+                userId: user.id,
+                username: user.username, 
+                role: user.role,
+                cameras: userCameras
+            }, 
+            JWT_SECRET, 
+            { expiresIn: '24h' }
+        );
+        
+        res.json({ 
+            token, 
+            user: { 
+                id: user.id,
+                username: user.username, 
+                role: user.role, 
+                cameras: userCameras 
+            } 
+        });
+    } catch (error) {
+        console.error('Auth error:', error);
+        res.status(500).json({ error: 'Authentication failed' });
+    }
+});
+
+// Валидация токена
+app.get('/auth/validate', verifyToken, (req, res) => {
+    res.json({
+        valid: true,
+        user: {
+            id: req.user.userId,
+            username: req.user.username,
+            role: req.user.role,
+            cameras: req.user.cameras
+        }
+    });
+});
+
+// ===============================
+// УПРАВЛЕНИЕ КАМЕРАМИ ЧЕРЕЗ PRISMA
+// ===============================
+
+// Список доступных камер
+app.get('/api/cameras', verifyToken, async (req, res) => {
+    try {
+        let cameraQuery = {};
+        
+        // Если не админ, ограничиваем доступ
+        if (req.user.role !== 'ADMIN') {
+            cameraQuery = {
+                permissions: {
+                    some: {
+                        userId: req.user.userId,
+                        canView: true
+                    }
+                }
+            };
+        }
+        
+        const cameras = await prisma.camera.findMany({
+            where: cameraQuery,
+            orderBy: { position: 'asc' }
+        });
+        
+        // Проверяем статус HLS стримов
+        const camerasWithStatus = cameras.map(camera => {
+            let hasStream = false;
             
-            let status = 'offline';
-            let adaptiveHls = false;
-            
-            if (fs.existsSync(masterPlaylist)) {
-                status = 'online';
-                adaptiveHls = true;
-            } else if (fs.existsSync(hlsFile)) {
-                status = 'online';
+            if (fs.existsSync(HLS_DIR)) {
+                const playlistPath = path.join(HLS_DIR, `camera_${camera.channelId}`, 'playlist.m3u8');
+                hasStream = fs.existsSync(playlistPath);
             }
             
             return {
@@ -229,9 +291,10 @@ app.get('/api/cameras/list', verifyApiKey, (req, res) => {
                 channelId: camera.channelId,
                 name: camera.name,
                 position: camera.position,
-                status: status,
                 isActive: camera.isActive,
-                adaptiveHls: adaptiveHls
+                status: hasStream ? 'ONLINE' : 'OFFLINE',
+                rtspUrl: camera.rtspUrl,
+                hasStream
             };
         });
         
@@ -247,7 +310,7 @@ app.get('/api/cameras/list', verifyApiKey, (req, res) => {
 });
 
 // Генерация токена для доступа к стриму
-app.post('/api/stream/token', verifyApiKey, (req, res) => {
+app.post('/api/stream/token', verifyApiKey, async (req, res) => {
     const { userId, cameraId } = req.body;
     
     if (!userId || !cameraId) {
@@ -256,22 +319,40 @@ app.post('/api/stream/token', verifyApiKey, (req, res) => {
     
     try {
         // Находим пользователя
-        const user = Object.values(USERS_DB).find(u => u.id === parseInt(userId));
+        const user = await prisma.user.findUnique({
+            where: { id: parseInt(userId) },
+            include: {
+                permissions: {
+                    include: {
+                        camera: true
+                    }
+                }
+            }
+        });
+        
         if (!user) {
             return res.status(404).json({ error: 'User not found' });
         }
         
         // Находим камеру
-        const camera = CAMERAS_DB.find(c => c.id === parseInt(cameraId));
+        const camera = await prisma.camera.findUnique({
+            where: { id: parseInt(cameraId) }
+        });
+        
         if (!camera) {
             return res.status(404).json({ error: 'Camera not found' });
         }
         
         // Проверяем права доступа
-        const hasAccess = user.role === 'admin' || user.cameras.includes(camera.channelId);
+        const hasAccess = user.role === 'ADMIN' || 
+            user.permissions.some(p => p.camera.channelId === camera.channelId && p.canView);
+        
         if (!hasAccess) {
             return res.status(403).json({ error: 'Access denied to this camera' });
         }
+        
+        // Получаем список камер для пользователя
+        const userCameras = user.permissions.map(p => p.camera.channelId);
         
         // Генерируем токен
         const streamToken = jwt.sign(
@@ -282,7 +363,7 @@ app.post('/api/stream/token', verifyApiKey, (req, res) => {
                 cameraId: camera.id,
                 channelId: camera.channelId,
                 type: 'stream',
-                cameras: user.cameras
+                cameras: userCameras
             },
             JWT_SECRET,
             { expiresIn: '3600s' } // 1 час
@@ -304,524 +385,38 @@ app.post('/api/stream/token', verifyApiKey, (req, res) => {
     }
 });
 
-// Обновление информации о камере
-app.put('/api/cameras/:cameraId', verifyApiKey, (req, res) => {
-    const { cameraId } = req.params;
-    const { name, position } = req.body;
-    
-    try {
-        const camera = CAMERAS_DB.find(c => c.id === parseInt(cameraId));
-        if (!camera) {
-            return res.status(404).json({ error: 'Camera not found' });
-        }
-        
-        if (name) camera.name = name;
-        if (position) camera.position = parseInt(position);
-        
-        res.json({ 
-            success: true,
-            camera: {
-                id: camera.id,
-                channelId: camera.channelId,
-                name: camera.name,
-                position: camera.position
-            }
-        });
-    } catch (error) {
-        console.error('Error updating camera:', error);
-        res.status(500).json({ error: 'Failed to update camera' });
-    }
-});
-
 // ===============================
-// АУТЕНТИФИКАЦИЯ
+// HLS STREAMING
 // ===============================
 
-// Получение токена
-app.post('/auth/token', (req, res) => {
-    const { username, password } = req.body;
-    
-    if (!username || !password) {
-        return res.status(400).json({ error: 'Username and password required' });
-    }
-    
-    const user = USERS_DB[username];
-    if (!user || user.password !== password) {
-        return res.status(401).json({ error: 'Invalid credentials' });
-    }
-    
-    const token = jwt.sign(
-        { 
-            userId: user.id,
-            username: user.username, 
-            role: user.role,
-            cameras: user.cameras
-        }, 
-        JWT_SECRET, 
-        { expiresIn: '24h' }
-    );
-    
-    res.json({ 
-        token, 
-        user: { 
-            id: user.id,
-            username: user.username, 
-            role: user.role, 
-            cameras: user.cameras 
-        } 
-    });
-});
-
-// Валидация токена
-app.get('/auth/validate', verifyToken, (req, res) => {
-    res.json({
-        valid: true,
-        user: {
-            id: req.user.userId,
-            username: req.user.username,
-            role: req.user.role,
-            cameras: req.user.cameras
-        }
-    });
-});
-
-// ===============================
-// УПРАВЛЕНИЕ КАМЕРАМИ
-// ===============================
-
-// Список доступных камер
-app.get('/api/cameras', verifyToken, (req, res) => {
-    try {
-        let availableCameras = [];
-        
-        // Проверяем существует ли HLS_DIR
-        if (fs.existsSync(HLS_DIR)) {
-            const files = fs.readdirSync(HLS_DIR);
-            
-            // Проверяем adaptive HLS камеры
-            const adaptiveDirs = files.filter(f => f.startsWith('camera_') && 
-                fs.statSync(path.join(HLS_DIR, f)).isDirectory());
-            
-            adaptiveDirs.forEach(dir => {
-                const match = dir.match(/camera_(\d+)/);
-                if (match) {
-                    const cameraId = parseInt(match[1]);
-                    const masterPlaylist = path.join(HLS_DIR, dir, 'master.m3u8');
-                    if (fs.existsSync(masterPlaylist)) {
-                        // Проверяем что файл не пустой и обновлен в последние 5 минут
-                        const stats = fs.statSync(masterPlaylist);
-                        const isRecent = (Date.now() - stats.mtime.getTime()) < 300000; // 5 минут
-                        if (stats.size > 0 && isRecent) {
-                            availableCameras.push(cameraId);
-                        } else {
-                            console.log(`Camera ${cameraId}: outdated (${Math.round((Date.now() - stats.mtime.getTime()) / 1000)}s old) or empty (${stats.size}b)`);
-                        }
-                    }
-                }
-            });
-            
-            // Проверяем legacy HLS камеры
-            const legacyFiles = files.filter(file => file.endsWith('.m3u8'));
-            legacyFiles.forEach(file => {
-                const match = file.match(/camera_(\d+)\.m3u8/);
-                if (match) {
-                    const cameraId = parseInt(match[1]);
-                    if (!availableCameras.includes(cameraId)) {
-                        // Проверяем что файл свежий (5 минут)
-                        const filePath = path.join(HLS_DIR, file);
-                        const stats = fs.statSync(filePath);
-                        const isRecent = (Date.now() - stats.mtime.getTime()) < 300000; // 5 минут
-                        if (stats.size > 0 && isRecent) {
-                            availableCameras.push(cameraId);
-                        } else {
-                            console.log(`Camera ${cameraId} (legacy): outdated (${Math.round((Date.now() - stats.mtime.getTime()) / 1000)}s old) or empty (${stats.size}b)`);
-                        }
-                    }
-                }
-            });
-        }
-        
-        // ВРЕМЕННО: если нет активных камер, проверим что файлы вообще есть
-        if (availableCameras.length === 0) {
-            console.log('No active cameras found. HLS files may not exist or are not recent.');
-            console.log('HLS_DIR:', HLS_DIR);
-            console.log('Directory contents:', files.length > 0 ? files.slice(0, 10) : 'empty');
-            
-            // Проверим все .m3u8 файлы для диагностики
-            const allM3u8 = files.filter(f => f.endsWith('.m3u8'));
-            allM3u8.forEach(file => {
-                const filePath = path.join(HLS_DIR, file);
-                const stats = fs.statSync(filePath);
-                const ageSeconds = Math.round((Date.now() - stats.mtime.getTime()) / 1000);
-                console.log(`  ${file}: ${stats.size}b, ${ageSeconds}s old`);
-            });
-        } else {
-            console.log(`Found ${availableCameras.length} active cameras:`, availableCameras);
-        }
-        
-        // Формируем информацию о камерах с названиями
-        const camerasInfo = CAMERAS_DB
-            .filter(camera => req.user.role === 'admin' || req.user.cameras.includes(camera.channelId))
-            .map(camera => ({
-                id: camera.channelId,
-                name: camera.name,
-                position: camera.position,
-                status: availableCameras.includes(camera.channelId) ? 'online' : 'offline'
-            }));
-        
-        const userCameraIds = req.user.cameras || [];
-        const allowedCameras = req.user.role === 'admin' ? 
-            availableCameras : 
-            availableCameras.filter(id => userCameraIds.includes(id));
-        
-        res.json({ 
-            cameras: allowedCameras.sort(),
-            available: availableCameras.sort(),
-            camerasInfo: camerasInfo,
-            user_permissions: req.user.cameras,
-            role: req.user.role,
-            debug: {
-                hls_dir_exists: fs.existsSync(HLS_DIR),
-                total_cameras_found: availableCameras.length
-            }
-        });
-    } catch (error) {
-        console.error('Error listing cameras:', error);
-        res.status(500).json({ error: 'Failed to list cameras' });
-    }
-});
-
-// Информация о камере
-app.get('/api/camera/:cameraId/info', verifyToken, checkCameraAccess, (req, res) => {
+// Плейлист .m3u8
+app.get('/stream/:cameraId/playlist.m3u8', verifySegmentToken, (req, res) => {
     const { cameraId } = req.params;
     
-    // Проверяем adaptive HLS
-    const adaptiveDir = path.join(HLS_DIR, `camera_${cameraId}`);
-    const masterPlaylist = path.join(adaptiveDir, 'master.m3u8');
-    
-    // Проверяем legacy HLS
-    const legacyPlaylist = path.join(HLS_DIR, `camera_${cameraId}.m3u8`);
-    
-    try {
-        let cameraInfo = {
-            camera_id: parseInt(cameraId),
-            status: 'offline',
-            adaptive_hls: false,
-            legacy_hls: false
-        };
-        
-        if (fs.existsSync(masterPlaylist)) {
-            const stats = fs.statSync(masterPlaylist);
-            const qualitiesAvailable = [];
-            
-            // Проверяем доступные качества
-            for (const quality of ['360p', '480p', '720p', '1080p']) {
-                const qualityPlaylist = path.join(adaptiveDir, quality, 'playlist.m3u8');
-                if (fs.existsSync(qualityPlaylist)) {
-                    qualitiesAvailable.push(quality);
-                }
-            }
-            
-            cameraInfo = {
-                ...cameraInfo,
-                status: 'online',
-                adaptive_hls: true,
-                last_updated: stats.mtime,
-                qualities_available: qualitiesAvailable,
-                playlist_url: `/stream/${cameraId}/playlist.m3u8`
-            };
-        } else if (fs.existsSync(legacyPlaylist)) {
-            const stats = fs.statSync(legacyPlaylist);
-            
-            cameraInfo = {
-                ...cameraInfo,
-                status: 'online',
-                legacy_hls: true,
-                last_updated: stats.mtime,
-                playlist_url: `/stream/${cameraId}/playlist.m3u8`
-            };
-        } else {
-            return res.status(404).json({ error: 'Camera not found or offline' });
-        }
-        
-        res.json(cameraInfo);
-    } catch (error) {
-        console.error(`Error getting camera ${cameraId} info:`, error);
-        res.status(500).json({ error: 'Failed to get camera info' });
-    }
-});
-
-// ДОБАВЛЯЮ ОТСУТСТВУЮЩИЙ ENDPOINT - Информация о доступных качествах
-app.get('/api/camera/:cameraId/qualities', verifyToken, checkCameraAccess, (req, res) => {
-    const { cameraId } = req.params;
-    
-    try {
-        const qualities = [];
-        
-        // СНАЧАЛА проверяем есть ли adaptive HLS структура
-        const cameraDir = path.join(HLS_DIR, `camera_${cameraId}`);
-        
-        for (const quality of ['360p', '480p', '720p', '1080p']) {
-            const qualityDir = path.join(cameraDir, quality);
-            const playlistPath = path.join(qualityDir, 'playlist.m3u8');
-            
-            if (fs.existsSync(playlistPath)) {
-                qualities.push({
-                    quality,
-                    resolution: getResolutionForQuality(quality),
-                    bitrate: getBitrateForQuality(quality),
-                    available: true
-                });
-            }
-        }
-        
-        // Проверяем наличие legacy формата
-        const legacyPlaylist = path.join(HLS_DIR, `camera_${cameraId}.m3u8`);
-        const hasLegacy = fs.existsSync(legacyPlaylist);
-        
-        // Если adaptive качеств нет, но есть legacy - возвращаем одно "качество"
-        if (qualities.length === 0 && hasLegacy) {
-            console.log(`Camera ${cameraId}: using legacy HLS (single quality)`);
-            qualities.push({
-                quality: 'auto',
-                resolution: 'auto',
-                bitrate: 'auto',
-                available: true,
-                legacy: true
-            });
-        }
-        
-        res.json({
-            cameraId: parseInt(cameraId),
-            adaptiveSupported: qualities.length > 1,
-            legacySupported: hasLegacy,
-            qualities,
-            totalQualities: qualities.length,
-            format: hasLegacy && qualities.length <= 1 ? 'legacy' : 'adaptive'
-        });
-        
-    } catch (error) {
-        console.error('Error getting qualities:', error);
-        res.status(500).json({ error: 'Failed to get qualities' });
-    }
-});
-
-// Вспомогательные функции для qualities endpoint
-function getResolutionForQuality(quality) {
-    const resolutions = {
-        '360p': '640x360',
-        '480p': '854x480', 
-        '720p': '1280x720',
-        '1080p': '1920x1080'
-    };
-    return resolutions[quality] || 'unknown';
-}
-
-function getBitrateForQuality(quality) {
-    const bitrates = {
-        '360p': 800,
-        '480p': 1400,
-        '720p': 2800, 
-        '1080p': 5000
-    };
-    return bitrates[quality] || 0;
-}
-
-// ===============================
-// HLS СТРИМИНГ
-// ===============================
-
-// HLS плейлист (адаптивный и legacy)
-app.get('/stream/:cameraId/playlist.m3u8', verifyToken, checkCameraAccess, (req, res) => {
-    const { cameraId } = req.params;
-    const quality = req.query.quality;
-    
-    let playlistPath;
-    
-    // СНАЧАЛА проверяем legacy формат (у пользователя именно такой)
-    const legacyPath = path.join(HLS_DIR, `camera_${cameraId}.m3u8`);
-    
-    if (fs.existsSync(legacyPath)) {
-        playlistPath = legacyPath;
-        console.log(`Using legacy HLS for camera ${cameraId}: ${legacyPath}`);
-    } else if (quality && ['360p', '480p', '720p', '1080p'].includes(quality)) {
-        // Адаптивное качество (если есть)
-        playlistPath = path.join(HLS_DIR, `camera_${cameraId}`, quality, 'playlist.m3u8');
-    } else {
-        // Адаптивный master плейлист
-        const adaptivePath = path.join(HLS_DIR, `camera_${cameraId}`, 'master.m3u8');
-        if (fs.existsSync(adaptivePath)) {
-            playlistPath = adaptivePath;
-        }
-    }
-    
-    if (!playlistPath || !fs.existsSync(playlistPath)) {
-        console.log(`Stream not found for camera ${cameraId}. Checked paths:`, {
-            legacy: legacyPath,
-            exists: fs.existsSync(legacyPath)
-        });
-        return res.status(404).json({ error: 'Stream not available' });
-    }
-    
-    res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    
-    try {
-        let content = fs.readFileSync(playlistPath, 'utf8');
-        
-        // Генерируем токен для сегментов
-        const segmentToken = jwt.sign(
-            {
-                userId: req.user.userId,
-                username: req.user.username,
-                role: req.user.role,
-                channelId: parseInt(cameraId),
-                type: 'segment',
-                cameras: req.user.cameras
-            },
-            JWT_SECRET,
-            { expiresIn: '300s' } // 5 минут
-        );
-        
-        // Добавляем токены к сегментам
-        if (playlistPath.includes('master.m3u8')) {
-            // Master плейлист - токенизируем ссылки на плейлисты качества
-            content = content.replace(
-                /(\d+p\/playlist\.m3u8)/g, 
-                `$1?token=${segmentToken}`
-            );
-        } else if (quality) {
-            // Конкретное качество - токенизируем .ts файлы
-            content = content.replace(
-                /(segment_\d{3}\.ts)/g, 
-                `$1?token=${segmentToken}`
-            );
-        } else {
-            // Legacy формат - токенизируем camera_X_XXXX.ts файлы
-            content = content.replace(
-                /(camera_\d+_\d+\.ts)/g, 
-                `$1?token=${segmentToken}`
-            );
-        }
-        
-        console.log(`Playlist served: ${req.user.username} → camera ${cameraId} → ${playlistPath}`);
-        res.send(content);
-    } catch (error) {
-        console.error(`Error reading playlist for camera ${cameraId}:`, error);
-        res.status(500).json({ error: 'Failed to read playlist' });
-    }
-});
-
-// ДОБАВЛЯЮ ОТДЕЛЬНЫЙ МАРШРУТ ДЛЯ ПЛЕЙЛИСТОВ КАЧЕСТВА (для adaptive HLS - у вас не используется)
-app.get('/stream/:cameraId/:quality/playlist.m3u8', verifySegmentToken, (req, res) => {
-    const { cameraId, quality } = req.params;
-    
-    console.log(`Adaptive quality playlist request: camera ${cameraId}, quality ${quality} (not supported in legacy mode)`);
-    
-    if (!['360p', '480p', '720p', '1080p'].includes(quality)) {
-        return res.status(400).json({ error: 'Invalid quality parameter' });
-    }
-    
-    const playlistPath = path.join(HLS_DIR, `camera_${cameraId}`, quality, 'playlist.m3u8');
+    const playlistPath = path.join(HLS_DIR, `camera_${cameraId}`, 'playlist.m3u8');
     
     if (!fs.existsSync(playlistPath)) {
-        // У вас legacy формат, поэтому адаптивные плейлисты недоступны
-        return res.status(404).json({ 
-            error: 'Adaptive quality not available',
-            message: 'This camera uses legacy HLS format. Use /stream/' + cameraId + '/playlist.m3u8 instead'
-        });
+        return res.status(404).json({ error: 'Stream not found' });
     }
     
-    // Если все же есть adaptive структура
     res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-    res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    
-    try {
-        let content = fs.readFileSync(playlistPath, 'utf8');
-        
-        const segmentToken = jwt.sign(
-            {
-                userId: req.user.userId,
-                username: req.user.username,
-                role: req.user.role,
-                channelId: parseInt(cameraId),
-                type: 'segment',
-                cameras: req.user.cameras
-            },
-            JWT_SECRET,
-            { expiresIn: '300s' }
-        );
-        
-        content = content.replace(
-            /(segment_\d{3}\.ts)/g, 
-            `$1?token=${segmentToken}`
-        );
-        
-        console.log(`Quality playlist served: ${req.user.username} → camera ${cameraId} → ${quality}`);
-        res.send(content);
-    } catch (error) {
-        console.error(`Error reading quality playlist for camera ${cameraId}:`, error);
-        res.status(500).json({ error: 'Failed to read quality playlist' });
-    }
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(playlistPath);
 });
 
-// Adaptive HLS сегменты (для adaptive структуры - у вас не используется)
-app.get('/stream/:cameraId/:quality/:segment', verifySegmentToken, (req, res) => {
-    const { cameraId, quality, segment } = req.params;
-    
-    if (!['360p', '480p', '720p', '1080p'].includes(quality)) {
-        return res.status(400).json({ error: 'Invalid quality' });
-    }
-    
-    if (!segment.endsWith('.ts')) {
-        return res.status(400).json({ error: 'Invalid segment' });
-    }
-    
-    const segmentPath = path.join(HLS_DIR, `camera_${cameraId}`, quality, segment);
-    
-    if (!fs.existsSync(segmentPath)) {
-        // У вас legacy формат, поэтому adaptive сегменты недоступны
-        return res.status(404).json({ 
-            error: 'Adaptive segments not available',
-            message: 'This camera uses legacy HLS format. Segments are accessed directly by name'
-        });
-    }
-    
-    console.log(`Adaptive segment served: ${req.user.username} → camera ${cameraId} → ${quality} → ${segment}`);
-    
-    res.setHeader('Content-Type', 'video/mp2t');
-    res.setHeader('Cache-Control', 'public, max-age=300');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.sendFile(segmentPath);
-});
-
-// Legacy HLS сегменты (ваш формат: camera_X_XXXX.ts)
+// Видео сегменты .ts
 app.get('/stream/:cameraId/:segment', verifySegmentToken, (req, res) => {
     const { cameraId, segment } = req.params;
     
-    if (!segment.endsWith('.ts')) {
-        return res.status(400).json({ error: 'Invalid segment' });
-    }
+    const segmentPath = path.join(HLS_DIR, `camera_${cameraId}`, segment);
     
-    // Проверяем что сегмент принадлежит этой камере
-    if (!segment.startsWith(`camera_${cameraId}_`)) {
-        return res.status(400).json({ error: 'Segment does not belong to this camera' });
-    }
-    
-    const filePath = path.join(HLS_DIR, segment);
-    
-    if (!fs.existsSync(filePath)) {
+    if (!fs.existsSync(segmentPath)) {
         return res.status(404).json({ error: 'Segment not found' });
     }
     
-    console.log(`Legacy segment served: ${req.user.username} → camera ${cameraId} → ${segment}`);
-    
-    res.setHeader('Content-Type', 'video/mp2t');
-    res.setHeader('Cache-Control', 'public, max-age=60');
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.sendFile(filePath);
+    res.setHeader('Content-Type', 'video/MP2T');
+    res.setHeader('Cache-Control', 'max-age=10');
+    res.sendFile(segmentPath);
 });
 
 // ===============================
@@ -829,21 +424,29 @@ app.get('/stream/:cameraId/:segment', verifySegmentToken, (req, res) => {
 // ===============================
 
 // Начать запись
-app.post('/api/camera/:cameraId/start-recording', verifyToken, checkCameraAccess, (req, res) => {
+app.post('/api/camera/:cameraId/start-recording', verifyToken, checkCameraAccess, async (req, res) => {
     const { cameraId } = req.params;
     const recordingKey = `camera_${cameraId}`;
     
     if (activeRecordings.has(recordingKey)) {
-        return res.status(400).json({ error: 'Recording already in progress' });
+        return res.status(400).json({ error: 'Recording already in progress for this camera' });
     }
     
     try {
-        const timestamp = new Date().toISOString().slice(0, 19).replace(/:/g, '-');
+        // Находим камеру в БД
+        const camera = await prisma.camera.findFirst({
+            where: { channelId: parseInt(cameraId) }
+        });
+        
+        if (!camera) {
+            return res.status(404).json({ error: 'Camera not found' });
+        }
+        
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
         const filename = `camera_${cameraId}_${timestamp}.mp4`;
         const outputPath = path.join(RECORDINGS_DIR, filename);
         
-        const camera = CAMERAS_DB.find(c => c.channelId === parseInt(cameraId));
-        const rtspUrl = camera ? camera.rtspUrl : 
+        const rtspUrl = camera.rtspUrl || 
             `rtsp://${RTSP_USER}:${RTSP_PASS}@${RTSP_BASE_IP}:${RTSP_PORT}/chID=${cameraId}`;
         
         console.log(`Starting recording for camera ${cameraId}: ${filename}`);
@@ -862,21 +465,53 @@ app.post('/api/camera/:cameraId/start-recording', verifyToken, checkCameraAccess
         
         const ffmpegProcess = spawn('ffmpeg', ffmpegArgs);
         
+        // Создаем запись в БД
+        const recording = await prisma.recording.create({
+            data: {
+                cameraId: camera.id,
+                filename: filename,
+                startedBy: req.user.username,
+                startedAt: new Date()
+            }
+        });
+        
         activeRecordings.set(recordingKey, {
             process: ffmpegProcess,
             filename: filename,
             startTime: new Date(),
             outputPath: outputPath,
-            cameraId: cameraId
+            cameraId: cameraId,
+            recordingId: recording.id
         });
         
         ffmpegProcess.stderr.on('data', (data) => {
             console.log(`FFmpeg camera ${cameraId}: ${data.toString()}`);
         });
         
-        ffmpegProcess.on('close', (code) => {
+        ffmpegProcess.on('close', async (code) => {
             console.log(`Recording for camera ${cameraId} ended with code ${code}`);
-            activeRecordings.delete(recordingKey);
+            
+            const recordingData = activeRecordings.get(recordingKey);
+            if (recordingData) {
+                // Обновляем запись в БД
+                try {
+                    const stats = fs.statSync(outputPath);
+                    const duration = Math.floor((new Date() - recordingData.startTime) / 1000);
+                    
+                    await prisma.recording.update({
+                        where: { id: recordingData.recordingId },
+                        data: {
+                            endedAt: new Date(),
+                            duration: duration,
+                            fileSize: BigInt(stats.size)
+                        }
+                    });
+                } catch (error) {
+                    console.error('Error updating recording in DB:', error);
+                }
+                
+                activeRecordings.delete(recordingKey);
+            }
         });
         
         ffmpegProcess.on('error', (error) => {
@@ -889,7 +524,8 @@ app.post('/api/camera/:cameraId/start-recording', verifyToken, checkCameraAccess
             message: 'Recording started',
             filename: filename,
             camera: cameraId,
-            startTime: new Date().toISOString()
+            startTime: new Date().toISOString(),
+            recordingId: recording.id
         });
         
     } catch (error) {
@@ -899,7 +535,7 @@ app.post('/api/camera/:cameraId/start-recording', verifyToken, checkCameraAccess
 });
 
 // Остановить запись
-app.post('/api/camera/:cameraId/stop-recording', verifyToken, checkCameraAccess, (req, res) => {
+app.post('/api/camera/:cameraId/stop-recording', verifyToken, checkCameraAccess, async (req, res) => {
     const { cameraId } = req.params;
     const recordingKey = `camera_${cameraId}`;
     
@@ -922,8 +558,6 @@ app.post('/api/camera/:cameraId/stop-recording', verifyToken, checkCameraAccess,
         const endTime = new Date();
         const duration = Math.floor((endTime - recording.startTime) / 1000);
         
-        activeRecordings.delete(recordingKey);
-        
         res.json({
             success: true,
             message: 'Recording stopped',
@@ -943,175 +577,165 @@ app.post('/api/camera/:cameraId/stop-recording', verifyToken, checkCameraAccess,
 app.get('/api/camera/:cameraId/recording-status', verifyToken, checkCameraAccess, (req, res) => {
     const { cameraId } = req.params;
     const recordingKey = `camera_${cameraId}`;
+    
     const recording = activeRecordings.get(recordingKey);
     
-    if (recording) {
-        const duration = Math.floor((Date.now() - recording.startTime) / 1000);
-        res.json({
-            isRecording: true,
+    res.json({
+        success: true,
+        isRecording: !!recording,
+        recording: recording ? {
             filename: recording.filename,
             startTime: recording.startTime,
-            duration: duration
-        });
-    } else {
-        res.json({
-            isRecording: false
-        });
-    }
-});
-
-// ===============================
-// УПРАВЛЕНИЕ ЗАПИСЯМИ
-// ===============================
-
-// Список записей
-app.get('/api/recordings', verifyToken, (req, res) => {
-    try {
-        const files = fs.readdirSync(RECORDINGS_DIR);
-        const recordings = files
-            .filter(file => file.endsWith('.mp4'))
-            .map(file => {
-                const filePath = path.join(RECORDINGS_DIR, file);
-                const stats = fs.statSync(filePath);
-                const match = file.match(/camera_(\d+)_(.+)\.mp4/);
-                
-                return {
-                    filename: file,
-                    camera: match ? parseInt(match[1]) : null,
-                    timestamp: match ? match[2] : null,
-                    size: stats.size,
-                    created: stats.birthtime,
-                    downloadUrl: `/api/recordings/${file}`
-                };
-            })
-            .filter(recording => {
-                if (req.user.role === 'admin') return true;
-                return recording.camera && req.user.cameras.includes(recording.camera);
-            })
-            .sort((a, b) => b.created - a.created);
-        
-        res.json({ recordings });
-    } catch (error) {
-        console.error('Error listing recordings:', error);
-        res.status(500).json({ error: 'Failed to list recordings' });
-    }
-});
-
-// Скачать запись
-app.get('/api/recordings/:filename', verifyToken, (req, res) => {
-    const { filename } = req.params;
-    const filePath = path.join(RECORDINGS_DIR, filename);
-    
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({ error: 'Recording file not found' });
-    }
-    
-    // Проверяем права доступа
-    const cameraMatch = filename.match(/camera_(\d+)_/);
-    if (cameraMatch && req.user.role !== 'admin') {
-        const cameraId = parseInt(cameraMatch[1]);
-        if (!req.user.cameras.includes(cameraId)) {
-            return res.status(403).json({ error: 'Access denied to this recording' });
-        }
-    }
-    
-    console.log(`Downloading recording: ${filename}`);
-    
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-    res.sendFile(filePath);
-});
-
-// ===============================
-// СИСТЕМНАЯ ИНФОРМАЦИЯ
-// ===============================
-
-// Статус системы
-app.get('/status', (req, res) => {
-    try {
-        const files = fs.readdirSync(HLS_DIR);
-        
-        const m3u8Files = files.filter(f => f.endsWith('.m3u8')).length;
-        const tsFiles = files.filter(f => f.endsWith('.ts')).length;
-        const adaptiveDirs = files.filter(f => f.startsWith('camera_') && 
-            fs.statSync(path.join(HLS_DIR, f)).isDirectory()).length;
-        
-        const recordingFiles = fs.existsSync(RECORDINGS_DIR) ? 
-            fs.readdirSync(RECORDINGS_DIR).filter(f => f.endsWith('.mp4')).length : 0;
-        
-        res.json({ 
-            status: 'ok', 
-            service: 'askr-camera-system',
-            version: '2.1.0-simplified',
-            timestamp: new Date().toISOString(),
-            hls_directory: HLS_DIR,
-            recordings_directory: RECORDINGS_DIR,
-            legacy_cameras: m3u8Files,
-            adaptive_cameras: adaptiveDirs,
-            total_segments: tsFiles,
-            total_recordings: recordingFiles,
-            active_recordings: activeRecordings.size,
-            jwt_secret_configured: JWT_SECRET !== 'askr-secret-key-2025',
-            features: {
-                adaptive_hls: true,
-                legacy_hls: true,
-                simple_auth: true,
-                api_integration: true
-            }
-        });
-    } catch (error) {
-        res.status(500).json({
-            status: 'error',
-            service: 'askr-camera-system', 
-            error: error.message
-        });
-    }
-});
-
-// ===============================
-// ОБРАБОТКА ОШИБОК И ЗАВЕРШЕНИЕ
-// ===============================
-
-// 404 для всех остальных маршрутов
-app.use('*', (req, res) => {
-    res.status(404).json({ 
-        error: 'Not found',
-        path: req.originalUrl,
-        method: req.method
+            duration: Math.floor((new Date() - recording.startTime) / 1000)
+        } : null
     });
 });
 
+// Список записей
+app.get('/api/recordings', verifyToken, async (req, res) => {
+    try {
+        let recordingQuery = {};
+        
+        // Если не админ, ограничиваем доступ
+        if (req.user.role !== 'ADMIN') {
+            recordingQuery = {
+                camera: {
+                    permissions: {
+                        some: {
+                            userId: req.user.userId,
+                            canView: true
+                        }
+                    }
+                }
+            };
+        }
+        
+        const recordings = await prisma.recording.findMany({
+            where: recordingQuery,
+            include: {
+                camera: true
+            },
+            orderBy: { startedAt: 'desc' }
+        });
+        
+        res.json({
+            success: true,
+            recordings: recordings.map(r => ({
+                id: r.id,
+                filename: r.filename,
+                camera: {
+                    id: r.camera.id,
+                    channelId: r.camera.channelId,
+                    name: r.camera.name
+                },
+                duration: r.duration,
+                fileSize: r.fileSize.toString(),
+                startedBy: r.startedBy,
+                startedAt: r.startedAt,
+                endedAt: r.endedAt,
+                downloadUrl: `/api/recordings/${r.filename}`
+            }))
+        });
+    } catch (error) {
+        console.error('Error fetching recordings:', error);
+        res.status(500).json({ error: 'Failed to fetch recordings' });
+    }
+});
+
+// Скачивание записи
+app.get('/api/recordings/:filename', verifyToken, async (req, res) => {
+    const { filename } = req.params;
+    
+    try {
+        // Проверяем доступ к записи
+        const recording = await prisma.recording.findUnique({
+            where: { filename },
+            include: { camera: true }
+        });
+        
+        if (!recording) {
+            return res.status(404).json({ error: 'Recording not found' });
+        }
+        
+        // Проверяем права доступа
+        if (req.user.role !== 'ADMIN') {
+            const hasAccess = req.user.cameras.includes(recording.camera.channelId);
+            if (!hasAccess) {
+                return res.status(403).json({ error: 'Access denied to this recording' });
+            }
+        }
+        
+        const filePath = path.join(RECORDINGS_DIR, filename);
+        
+        if (!fs.existsSync(filePath)) {
+            return res.status(404).json({ error: 'Recording file not found on disk' });
+        }
+        
+        res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+        res.setHeader('Content-Type', 'video/mp4');
+        res.sendFile(filePath);
+        
+    } catch (error) {
+        console.error('Error downloading recording:', error);
+        res.status(500).json({ error: 'Failed to download recording' });
+    }
+});
+
+// ===============================
+// УПРАВЛЕНИЕ КАМЕРАМИ
+// ===============================
+
+// Обновление информации о камере
+app.put('/api/cameras/:cameraId', verifyApiKey, async (req, res) => {
+    const { cameraId } = req.params;
+    const { name, position } = req.body;
+    
+    try {
+        const camera = await prisma.camera.update({
+            where: { channelId: parseInt(cameraId) },
+            data: {
+                ...(name && { name }),
+                ...(position && { position: parseInt(position) })
+            }
+        });
+        
+        res.json({ 
+            success: true,
+            camera: {
+                id: camera.id,
+                channelId: camera.channelId,
+                name: camera.name,
+                position: camera.position
+            }
+        });
+    } catch (error) {
+        console.error('Error updating camera:', error);
+        res.status(500).json({ error: 'Failed to update camera' });
+    }
+});
+
+// ===============================
+// ЗАПУСК СЕРВЕРА
+// ===============================
+
 // Graceful shutdown
-process.on('SIGINT', () => {
-    console.log('\n🛑 Завершение работы системы...');
+process.on('SIGINT', async () => {
+    console.log('Shutting down gracefully...');
+    
+    // Останавливаем все активные записи
     for (const [key, recording] of activeRecordings) {
         console.log(`Stopping recording: ${recording.filename}`);
-        recording.process.stdin.write('q');
+        recording.process.kill('SIGTERM');
     }
-    setTimeout(() => process.exit(0), 5000);
+    
+    await prisma.$disconnect();
+    process.exit(0);
 });
 
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Получен SIGTERM, завершаем все записи...');
-    for (const [key, recording] of activeRecordings) {
-        console.log(`Stopping recording: ${recording.filename}`);
-        recording.process.stdin.write('q');
-    }
-    setTimeout(() => process.exit(0), 5000);
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🚀 ASKR Camera System running on port ${PORT}`);
+    console.log(`📹 HLS Directory: ${HLS_DIR}`);
+    console.log(`📼 Recordings Directory: ${RECORDINGS_DIR}`);
+    console.log(`🎯 RTSP Base: ${RTSP_BASE_IP}:${RTSP_PORT}`);
+    console.log(`🔐 JWT Secret: ${JWT_SECRET.substring(0, 10)}...`);
 });
-
-// Запуск сервера
-app.listen(PORT, () => {
-    console.log(`🚀 ASKR Camera System v2.1 (Simplified) running on port ${PORT}`);
-    console.log(`📁 HLS files: ${HLS_DIR}`);
-    console.log(`🎬 Recordings: ${RECORDINGS_DIR}`);
-    console.log(`🔑 JWT Secret: ${JWT_SECRET !== 'askr-secret-key-2025' ? 'Custom' : 'Default'}`);
-    console.log(`📊 Status: http://localhost:${PORT}/status`);
-    console.log(`🔗 Available users: admin, operator, user1, user2, user3, user4`);
-    console.log(`🎥 HLS endpoints:`);
-    console.log(`   GET /stream/:id/playlist.m3u8 - Master/Legacy playlist`);
-    console.log(`   GET /stream/:id/:quality/:segment - Adaptive segments`);
-    console.log(`   GET /stream/:id/:segment - Legacy segments`);
-});
-
-module.exports = app;
