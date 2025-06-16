@@ -1,10 +1,6 @@
-<<<<<<< HEAD
-# A script to manage RTSP camera streams and HLS segmenting.
-=======
 # RTSP to HLS Webcam Encoder
 
 A script to manage RTSP camera streams and HLS segmenting.
->>>>>>> 65ba8df (fix: make README use numbered lists for clarity)
 
 ## Features
 1. Check which cameras are online.
@@ -14,7 +10,6 @@ A script to manage RTSP camera streams and HLS segmenting.
 5. Reads settings from `.env` file for secure configuration.
 
 ## Environment Variables
-<<<<<<< HEAD
 - Configure a `.env` file in the script directory with the following variables:
   - `RTSP_BASE_IP=xxx.xxx.x.xxx`
   - `RTSP_PORT=xxxxx`
@@ -48,4 +43,4 @@ Create a `.env` file in the script directory with the following variables:
 1. Run the script:
    ```bash
    bash rtsp_to_hls.sh
->>>>>>> 65ba8df (fix: make README use numbered lists for clarity)
+
