@@ -23,7 +23,7 @@ services:
       - ${RECORDINGS_HOST_DIR}:/app/recordings
       - ./logs:/app/logs
     ports:
-      - "8082:8080"
+      - "8080:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
       interval: 30s
