@@ -1,0 +1,92 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Camera {
+  id         Int      @id @default(autoincrement())
+  channelId  Int      @unique @map("channel_id")
+  name       String   @default("")
+  position   Int      @default(0)
+  rtspUrl    String   @map("rtsp_url")
+  status     CameraStatus @default(OFFLINE)
+  isActive   Boolean  @default(true) @map("is_active")
+  createdAt  DateTime @default(now()) @map("created_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  recordings Recording[]
+  permissions UserCameraPermission[]
+
+  @@map("cameras")
+}
+
+model Recording {
+  id        Int      @id @default(autoincrement())
+  cameraId  Int      @map("camera_id")
+  filename  String   @unique
+  duration  Int      @default(0)
+  fileSize  BigInt   @default(0) @map("file_size")
+  startedBy String?  @map("started_by")
+  startedAt DateTime @default(now()) @map("started_at")
+  endedAt   DateTime? @map("ended_at")
+  
+  camera    Camera   @relation(fields: [cameraId], references: [id], onDelete: Cascade)
+
+  @@map("recordings")
+}
+
+model ApiKey {
+  id          Int      @id @default(autoincrement())
+  keyHash     String   @unique @map("key_hash")
+  serviceName String   @map("service_name")
+  permissions Json     @default("{}")
+  isActive    Boolean  @default(true) @map("is_active")
+  expiresAt   DateTime? @map("expires_at")
+  createdAt   DateTime @default(now()) @map("created_at")
+  lastUsedAt  DateTime? @map("last_used_at")
+
+  @@map("api_keys")
+}
+
+model User {
+  id       Int    @id @default(autoincrement())
+  username String @unique
+  role     UserRole @default(USER)
+  isActive Boolean @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  permissions UserCameraPermission[]
+
+  @@map("users")
+}
+
+model UserCameraPermission {
+  id       Int @id @default(autoincrement())
+  userId   Int @map("user_id")
+  cameraId Int @map("camera_id")
+  canView  Boolean @default(true) @map("can_view")
+  canRecord Boolean @default(false) @map("can_record")
+
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  camera Camera @relation(fields: [cameraId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, cameraId])
+  @@map("user_camera_permissions")
+}
+
+enum CameraStatus {
+  ONLINE
+  OFFLINE
+  ERROR
+  MAINTENANCE
+}
+
+enum UserRole {
+  ADMIN
+  OPERATOR  
+  USER
+}

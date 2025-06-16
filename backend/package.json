@@ -1,0 +1,45 @@
+{
+  "name": "hls-auth-proxy",
+  "version": "1.0.0",
+  "description": "HLS streaming server with JWT authentication",
+  "main": "auth-proxy.js",
+  "scripts": {
+    "start": "node auth-proxy.js",
+    "dev": "nodemon auth-proxy.js",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "db:migrate": "npx prisma migrate dev",
+    "db:generate": "npx prisma generate",
+    "db:seed": "node prisma/seed.js",
+    "db:studio": "npx prisma studio",
+    "db:reset": "npx prisma migrate reset"
+  },
+  "keywords": [
+    "hls",
+    "streaming",
+    "auth",
+    "jwt",
+    "rtsp"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@prisma/client": "^6.9.0",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "helmet": "^7.2.0",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.16.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1",
+    "prisma": "^6.9.0"
+  },
+  "engines": {
+    "node": ">=16.0.0"
+  },
+  "prisma": {
+    "seed": "node prisma/seed.js"
+  }
+}

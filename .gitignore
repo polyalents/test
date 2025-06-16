@@ -1,0 +1,29 @@
+# Игнорировать всё содержимое папки output кроме .gitkeep
+output/*
+!output/.gitkeep
+
+# Игнорировать HLS файлы везде
+*.m3u8
+*.ts
+
+# Игнорировать старые временные файлы
+hls/
+
+# Игнорировать env файлы кроме примера
+.env
+!.env.sample
+!.env.template
+
+# Системные файлы
+.DS_Store
+Thumbs.db
+
+# Логи
+*.log
+
+# PID файлы
+*.pid
+recordings/*.mp4
+recordings/
+recordings/*.mp4
+recordings/

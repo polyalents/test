@@ -1,0 +1,32 @@
+version: '3.8'
+
+services:
+  askr-app:
+    build: .
+    container_name: askr-camera-system
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://askr:${POSTGRES_PASSWORD}@host.docker.internal:5432/askr_cameras
+      RTSP_BASE_IP: ${RTSP_BASE_IP}
+      RTSP_PORT: ${RTSP_PORT}
+      RTSP_USER: ${RTSP_USER}
+      RTSP_PASS: ${RTSP_PASS}
+      JWT_SECRET: ${JWT_SECRET}
+      BACKEND_PORT: ${BACKEND_PORT}
+      NODE_ENV: production
+      HLS_DIR: /app/output
+      RECORDINGS_DIR: /app/recordings
+      API_ACCESS_KEY: ${API_ACCESS_KEY}
+      STREAM_TOKEN_EXPIRY: ${STREAM_TOKEN_EXPIRY}
+    volumes:
+      - ${HLS_HOST_DIR}:/app/output:ro
+      - ${RECORDINGS_HOST_DIR}:/app/recordings
+      - ./logs:/app/logs
+    ports:
+      - "8082:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
