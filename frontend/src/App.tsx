@@ -77,42 +77,39 @@ function App() {
       
       const data = await response.json();
       
-      // ПОЛУЧАЕМ ДОСТУПНЫЕ КАМЕРЫ ИЗ API
-      const availableCameras = data.available || []; // Реально работающие камеры
-      const userCameras = data.cameras || []; // Камеры доступные пользователю
-      const camerasInfo = data.camerasInfo || []; // Дополнительная инфа
+      // ПРАВИЛЬНАЯ ОБРАБОТКА API ОТВЕТА
+      console.log('API Response:', data);
       
-      console.log('Available cameras:', availableCameras);
-      console.log('User cameras:', userCameras);
-      console.log('Cameras info:', camerasInfo);
+      if (!data.success || !data.cameras) {
+        throw new Error('Некорректный ответ API');
+      }
       
-      // СОЗДАЕМ КАМЕРЫ С ПРАВИЛЬНЫМ СТАТУСОМ
-      const cameras: Camera[] = [];
-      for (let i = 1; i <= 24; i++) {
-        // Ищем инфо о камере из API
-        const cameraInfo = camerasInfo.find(c => c.id === i);
-        
-        // ОПРЕДЕЛЯЕМ РЕАЛЬНЫЙ СТАТУС
+      // КОНВЕРТИРУЕМ ИЗ API ФОРМАТА В ФОРМАТ ФРОНТЕНДА
+      const cameras: Camera[] = data.cameras.map((apiCamera: any) => {
+        // Маппинг статусов: API -> Frontend
         let status: 'active' | 'inactive' | 'error' = 'inactive';
         
-        if (availableCameras.includes(i)) {
-          status = 'active'; // Камера реально работает
-        } else if (userCameras.includes(i)) {
-          status = 'error'; // Пользователь имеет доступ, но камера не работает
+        if (apiCamera.status === 'ONLINE' && apiCamera.hasStream) {
+          status = 'active';
+        } else if (apiCamera.status === 'OFFLINE') {
+          status = 'inactive';  
+        } else {
+          status = 'error';
         }
         
-        cameras.push({
-          id: `camera_${i}`,
-          name: cameraInfo?.name || `Камера ${i}`,
-          rtsp_url: `rtsp://192.168.4.200:62342/chID=${i}`,
-          hls_url: `http://176.98.178.23:8080/stream/${i}/playlist.m3u8`,
+        return {
+          id: `camera_${apiCamera.channelId}`,
+          name: apiCamera.name || `Камера ${apiCamera.channelId}`,
+          rtsp_url: apiCamera.rtspUrl || `rtsp://192.168.4.200:62342/chID=${apiCamera.channelId}`,
+          hls_url: `http://176.98.178.23:8080/stream/${apiCamera.channelId}/playlist.m3u8`,
           status: status,
           resolution: '1920x1080',
           fps: 25,
-          adaptiveSupported: false // Будет обновлено при загрузке качеств
-        });
-      }
+          adaptiveSupported: apiCamera.streamType === 'adaptive'
+        };
+      });
       
+      console.log('Converted cameras:', cameras);
       setCameras(cameras);
       
       // ПРОВЕРЯЕМ АДАПТИВНУЮ ПОДДЕРЖКУ АСИНХРОННО

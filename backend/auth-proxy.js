@@ -125,9 +125,9 @@ const checkCameraAccess = async (req, res, next) => {
     }
 };
 
-// Проверка токена для сегментов
+// Проверка токена для сегментов (упрощенная для совместимости)
 const verifySegmentToken = (req, res, next) => {
-    const token = req.query.token;
+    const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
     
     if (!token) {
         return res.status(401).json({ error: 'Token required for stream access' });
@@ -137,8 +137,8 @@ const verifySegmentToken = (req, res, next) => {
         const decoded = jwt.verify(token, JWT_SECRET);
         req.user = decoded;
         
-        // Дополнительно проверяем тип токена
-        if (decoded.type !== 'stream') {
+        // Проверяем тип токена только если он указан (для совместимости)
+        if (decoded.type && decoded.type !== 'stream') {
             return res.status(403).json({ error: 'Invalid token type for streaming' });
         }
         
@@ -277,13 +277,50 @@ app.get('/api/cameras', verifyToken, async (req, res) => {
             orderBy: { position: 'asc' }
         });
         
-        // Проверяем статус HLS стримов
+        // Проверяем статус HLS стримов (поддерживаем legacy и adaptive)
         const camerasWithStatus = cameras.map(camera => {
             let hasStream = false;
+            let streamType = 'none';
             
             if (fs.existsSync(HLS_DIR)) {
-                const playlistPath = path.join(HLS_DIR, `camera_${camera.channelId}`, 'playlist.m3u8');
-                hasStream = fs.existsSync(playlistPath);
+                // Проверяем adaptive формат СНАЧАЛА (активные потоки)
+                const adaptiveMaster = path.join(HLS_DIR, `camera_${camera.channelId}`, 'master.m3u8');
+                const adaptivePlaylist = path.join(HLS_DIR, `camera_${camera.channelId}`, '1080p', 'playlist.m3u8');
+                
+                // Проверяем legacy формат (старые файлы)
+                const legacyPlaylist = path.join(HLS_DIR, `camera_${camera.channelId}.m3u8`);
+                
+                if (fs.existsSync(adaptiveMaster) || fs.existsSync(adaptivePlaylist)) {
+                    hasStream = true;
+                    streamType = 'adaptive';
+                    
+                    // Дополнительно проверяем что файл не слишком старый (максимум 5 минут)
+                    try {
+                        const statsPath = fs.existsSync(adaptiveMaster) ? adaptiveMaster : adaptivePlaylist;
+                        const stats = fs.statSync(statsPath);
+                        const ageMinutes = (Date.now() - stats.mtime.getTime()) / (1000 * 60);
+                        if (ageMinutes > 5) {
+                            hasStream = false;
+                            streamType = 'adaptive_stale';
+                        }
+                    } catch (error) {
+                        // Игнорируем ошибки проверки времени
+                    }
+                } else if (fs.existsSync(legacyPlaylist)) {
+                    // Проверяем что legacy файл не слишком старый
+                    try {
+                        const stats = fs.statSync(legacyPlaylist);
+                        const ageMinutes = (Date.now() - stats.mtime.getTime()) / (1000 * 60);
+                        if (ageMinutes <= 60) { // Legacy файлы могут быть старше
+                            hasStream = true;
+                            streamType = 'legacy';
+                        } else {
+                            streamType = 'legacy_stale';
+                        }
+                    } catch (error) {
+                        streamType = 'legacy_error';
+                    }
+                }
             }
             
             return {
@@ -294,7 +331,8 @@ app.get('/api/cameras', verifyToken, async (req, res) => {
                 isActive: camera.isActive,
                 status: hasStream ? 'ONLINE' : 'OFFLINE',
                 rtspUrl: camera.rtspUrl,
-                hasStream
+                hasStream,
+                streamType
             };
         });
         
@@ -389,13 +427,54 @@ app.post('/api/stream/token', verifyApiKey, async (req, res) => {
 // HLS STREAMING
 // ===============================
 
-// Плейлист .m3u8
+// HLS плейлист (поддерживает legacy и adaptive форматы)
 app.get('/stream/:cameraId/playlist.m3u8', verifySegmentToken, (req, res) => {
     const { cameraId } = req.params;
+    const quality = req.query.quality;
     
-    const playlistPath = path.join(HLS_DIR, `camera_${cameraId}`, 'playlist.m3u8');
+    let playlistPath;
     
-    if (!fs.existsSync(playlistPath)) {
+    // СНАЧАЛА проверяем adaptive формат (приоритет)
+    const adaptiveDir = path.join(HLS_DIR, `camera_${cameraId}`);
+    const adaptiveMaster = path.join(adaptiveDir, 'master.m3u8');
+    
+    if (quality && ['360p', '480p', '720p', '1080p'].includes(quality)) {
+        // Запрос конкретного качества
+        playlistPath = path.join(adaptiveDir, quality, 'playlist.m3u8');
+        console.log(`Requesting adaptive HLS ${quality} for camera ${cameraId}`);
+    } else if (fs.existsSync(adaptiveMaster)) {
+        // Возвращаем master плейлист для adaptive
+        playlistPath = adaptiveMaster;
+        console.log(`Using adaptive master HLS for camera ${cameraId}: ${adaptiveMaster}`);
+    } else if (fs.existsSync(adaptiveDir)) {
+        // Fallback на любое доступное качество
+        const qualities = ['1080p', '720p', '480p', '360p'];
+        for (const q of qualities) {
+            const qPath = path.join(adaptiveDir, q, 'playlist.m3u8');
+            if (fs.existsSync(qPath)) {
+                playlistPath = qPath;
+                console.log(`Using adaptive fallback ${q} for camera ${cameraId}`);
+                break;
+            }
+        }
+    }
+    
+    // Если adaptive не найден, проверяем legacy формат
+    if (!playlistPath || !fs.existsSync(playlistPath)) {
+        const legacyPath = path.join(HLS_DIR, `camera_${cameraId}.m3u8`);
+        if (fs.existsSync(legacyPath)) {
+            playlistPath = legacyPath;
+            console.log(`Using legacy HLS for camera ${cameraId}: ${legacyPath}`);
+        }
+    }
+    
+    if (!playlistPath || !fs.existsSync(playlistPath)) {
+        console.log(`Stream not found for camera ${cameraId}. Checked paths:`, {
+            adaptiveMaster: adaptiveMaster,
+            adaptiveDir: adaptiveDir,
+            legacy: path.join(HLS_DIR, `camera_${cameraId}.m3u8`),
+            requestedQuality: quality
+        });
         return res.status(404).json({ error: 'Stream not found' });
     }
     
@@ -404,13 +483,37 @@ app.get('/stream/:cameraId/playlist.m3u8', verifySegmentToken, (req, res) => {
     res.sendFile(playlistPath);
 });
 
-// Видео сегменты .ts
+// Видео сегменты .ts (поддерживает legacy и adaptive)
 app.get('/stream/:cameraId/:segment', verifySegmentToken, (req, res) => {
     const { cameraId, segment } = req.params;
+    const quality = req.query.quality;
     
-    const segmentPath = path.join(HLS_DIR, `camera_${cameraId}`, segment);
+    let segmentPath;
     
-    if (!fs.existsSync(segmentPath)) {
+    // Для adaptive формата сегменты в папке качества
+    if (quality && ['360p', '480p', '720p', '1080p'].includes(quality)) {
+        segmentPath = path.join(HLS_DIR, `camera_${cameraId}`, quality, segment);
+    } else {
+        // Ищем в adaptive папках
+        const qualities = ['1080p', '720p', '480p', '360p'];
+        for (const q of qualities) {
+            const qPath = path.join(HLS_DIR, `camera_${cameraId}`, q, segment);
+            if (fs.existsSync(qPath)) {
+                segmentPath = qPath;
+                break;
+            }
+        }
+    }
+    
+    // Fallback на legacy формат
+    if (!segmentPath || !fs.existsSync(segmentPath)) {
+        const legacySegmentPath = path.join(HLS_DIR, segment);
+        if (fs.existsSync(legacySegmentPath)) {
+            segmentPath = legacySegmentPath;
+        }
+    }
+    
+    if (!segmentPath || !fs.existsSync(segmentPath)) {
         return res.status(404).json({ error: 'Segment not found' });
     }
     
@@ -684,6 +787,130 @@ app.get('/api/recordings/:filename', verifyToken, async (req, res) => {
 // ===============================
 // УПРАВЛЕНИЕ КАМЕРАМИ
 // ===============================
+
+// Информация о доступных качествах камеры
+app.get('/api/camera/:cameraId/qualities', verifyToken, checkCameraAccess, (req, res) => {
+    const { cameraId } = req.params;
+    
+    try {
+        const qualities = [];
+        let adaptiveSupported = false;
+        let format = 'legacy';
+        
+        // Проверяем adaptive HLS (папка camera_X с master.m3u8)
+        const adaptiveDir = path.join(HLS_DIR, `camera_${cameraId}`);
+        const adaptiveMaster = path.join(adaptiveDir, 'master.m3u8');
+        const legacyPlaylist = path.join(HLS_DIR, `camera_${cameraId}.m3u8`);
+        
+        if (fs.existsSync(adaptiveMaster) || fs.existsSync(adaptiveDir)) {
+            // Проверяем доступные качества в adaptive формате
+            const qualityDirs = ['360p', '480p', '720p', '1080p'];
+            
+            for (const quality of qualityDirs) {
+                const qualityPlaylist = path.join(adaptiveDir, quality, 'playlist.m3u8');
+                if (fs.existsSync(qualityPlaylist)) {
+                    // Проверяем что файл свежий (не старше 5 минут)
+                    try {
+                        const stats = fs.statSync(qualityPlaylist);
+                        const ageMinutes = (Date.now() - stats.mtime.getTime()) / (1000 * 60);
+                        
+                        qualities.push({
+                            quality: quality,
+                            resolution: getResolutionForQuality(quality),
+                            bitrate: getBitrateForQuality(quality),
+                            available: ageMinutes <= 5,
+                            legacy: false,
+                            lastUpdate: stats.mtime.toISOString(),
+                            ageMinutes: Math.round(ageMinutes)
+                        });
+                    } catch (error) {
+                        qualities.push({
+                            quality: quality,
+                            resolution: getResolutionForQuality(quality),
+                            bitrate: getBitrateForQuality(quality),
+                            available: false,
+                            legacy: false,
+                            error: 'stat_failed'
+                        });
+                    }
+                }
+            }
+            
+            if (qualities.length > 0 && qualities.some(q => q.available)) {
+                adaptiveSupported = true;
+                format = 'adaptive';
+            }
+        }
+        
+        // Если нет активного adaptive, проверяем legacy
+        if (!adaptiveSupported && fs.existsSync(legacyPlaylist)) {
+            try {
+                const stats = fs.statSync(legacyPlaylist);
+                const ageMinutes = (Date.now() - stats.mtime.getTime()) / (1000 * 60);
+                
+                qualities.push({
+                    quality: 'auto',
+                    resolution: '1920x1080',
+                    bitrate: '5000K',
+                    available: ageMinutes <= 60, // Legacy может быть старше
+                    legacy: true,
+                    lastUpdate: stats.mtime.toISOString(),
+                    ageMinutes: Math.round(ageMinutes)
+                });
+                format = 'legacy';
+            } catch (error) {
+                qualities.push({
+                    quality: 'auto',
+                    resolution: '1920x1080',
+                    bitrate: '5000K',
+                    available: false,
+                    legacy: true,
+                    error: 'stat_failed'
+                });
+            }
+        }
+        
+        res.json({
+            success: true,
+            cameraId: parseInt(cameraId),
+            adaptiveSupported: adaptiveSupported,
+            format: format,
+            qualities: qualities,
+            totalQualities: qualities.length,
+            availableQualities: qualities.filter(q => q.available).length,
+            paths: {
+                adaptiveDir: adaptiveDir,
+                adaptiveMaster: adaptiveMaster,
+                legacyPlaylist: legacyPlaylist
+            }
+        });
+        
+    } catch (error) {
+        console.error(`Error getting qualities for camera ${cameraId}:`, error);
+        res.status(500).json({ error: 'Failed to get qualities' });
+    }
+});
+
+// Вспомогательные функции для qualities endpoint
+function getResolutionForQuality(quality) {
+    const resolutions = {
+        '360p': '640x360',
+        '480p': '854x480', 
+        '720p': '1280x720',
+        '1080p': '1920x1080'
+    };
+    return resolutions[quality] || 'unknown';
+}
+
+function getBitrateForQuality(quality) {
+    const bitrates = {
+        '360p': 800,
+        '480p': 1400,
+        '720p': 2800, 
+        '1080p': 5000
+    };
+    return bitrates[quality] || 0;
+}
 
 // Обновление информации о камере
 app.put('/api/cameras/:cameraId', verifyApiKey, async (req, res) => {

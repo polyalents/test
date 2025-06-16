@@ -13,7 +13,7 @@ mkdir -p "${CAMERA_DIR}/720p"
 mkdir -p "${CAMERA_DIR}/1080p"
 
 # RTSP URL из env переменных
-RTSP_URL="rtsp://${RTSP_USER}:${RTSP_PASS}@${RTSP_BASE_IP}:${RTSP_PORT}/chID=${CAMERA_ID}1"
+RTSP_URL="rtsp://${RTSP_USER}:${RTSP_PASS}@${RTSP_BASE_IP}:${RTSP_PORT}/chID=${CAMERA_ID}"
 
 echo "Starting adaptive HLS for Camera ${CAMERA_ID}"
 echo "RTSP URL: ${RTSP_URL}"
