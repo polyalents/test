@@ -11,6 +11,7 @@ model Camera {
   id         Int      @id @default(autoincrement())
   channelId  Int      @unique @map("channel_id")
   name       String   @default("")
+  password   String
   position   Int      @default(0)
   rtspUrl    String   @map("rtsp_url")
   status     CameraStatus @default(OFFLINE)

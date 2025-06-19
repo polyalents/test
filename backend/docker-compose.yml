@@ -4,10 +4,10 @@ services:
   askr-app:
     build: .
     container_name: askr-camera-system
+    network_mode: "host"
     restart: unless-stopped
     environment:
-      DATABASE_URL: postgresql://askr:${POSTGRES_PASSWORD}@host.docker.internal:5432/askr_cameras
-      RTSP_BASE_IP: ${RTSP_BASE_IP}
+      DATABASE_URL: postgresql://askr:${POSTGRES_PASSWORD}@localhost:5432/askr_cameras
       RTSP_PORT: ${RTSP_PORT}
       RTSP_USER: ${RTSP_USER}
       RTSP_PASS: ${RTSP_PASS}
@@ -22,8 +22,6 @@ services:
       - ${HLS_HOST_DIR}:/app/output:ro
       - ${RECORDINGS_HOST_DIR}:/app/recordings
       - ./logs:/app/logs
-    ports:
-      - "8080:8080"
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/status"]
       interval: 30s
