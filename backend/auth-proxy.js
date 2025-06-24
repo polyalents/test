@@ -162,46 +162,41 @@ app.use((req, res, next) => {
 // ===============================
 
 // Проверка API ключа (с fallback без БД)
-const verifyApiKey = async (req, res, next) => {
-    const apiKey = req.headers['x-api-key'];
-    
+async function verifyApiKey(apiKey) {
     if (!apiKey) {
-        return res.status(401).json({ error: 'API key required' });
+        return false;
     }
-
+    
     // Если Prisma не готова - используем простую проверку
     if (!prismaReady) {
-        if (apiKey === API_ACCESS_KEY || apiKey === 'askr-api-key-2025' || apiKey === 'askr-dev-key-2025') {
-            req.apiKey = { key: apiKey, name: 'fallback' };
-            return next();
-        } else {
-            return res.status(401).json({ error: 'Invalid API key (fallback mode)' });
-        }
+        return apiKey === API_ACCESS_KEY || apiKey === 'askr-api-key-2025' || apiKey === 'askr-dev-key-2025';
     }
 
     try {
         const validKey = await prisma.apiKey.findFirst({
             where: { 
-                key: apiKey,
+                keyHash: apiKey, // ИСПРАВЛЕНО: используем keyHash вместо key
                 isActive: true 
             }
         });
-
-        if (!validKey) {
-            return res.status(401).json({ error: 'Invalid API key' });
-        }
-
-        req.apiKey = validKey;
-        next();
+        return !!validKey;
     } catch (error) {
         console.error('API key verification error:', error);
         // Fallback к простой проверке
-        if (apiKey === API_ACCESS_KEY) {
-            req.apiKey = { key: apiKey, name: 'fallback' };
-            return next();
-        }
-        return res.status(500).json({ error: 'Internal server error' });
+        return apiKey === API_ACCESS_KEY;
     }
+}
+
+// Middleware для проверки API ключа
+const requireApiKey = async (req, res, next) => {
+    const apiKey = req.headers['x-api-key'];
+    
+    if (!await verifyApiKey(apiKey)) {
+        return res.status(401).json({ error: 'Invalid API key' });
+    }
+    
+    req.apiKey = { key: apiKey };
+    next();
 };
 
 // Проверка JWT токена
@@ -287,6 +282,19 @@ const blockDirectHLSAccess = (req, res, next) => {
     next();
 };
 
+// Функция получения fallback камер
+function getFallbackCameras() {
+    return Array.from({length: 24}, (_, i) => ({
+        id: i + 1,
+        channelId: i + 1,
+        name: `Камера ${i + 1}`,
+        position: i + 1,
+        isActive: true,
+        status: "online",
+        adaptiveHls: true
+    }));
+}
+
 // ===============================
 // ПРИМЕНЯЕМ MIDDLEWARE
 // ===============================
@@ -299,34 +307,147 @@ app.use(blockDirectHLSAccess);
 // API ENDPOINTS
 // ===============================
 
-// Получение списка камер (с fallback без БД)
-app.get('/api/cameras/list', verifyApiKey, async (req, res) => {
+// ===============================
+// АВТОРИЗАЦИЯ
+// ===============================
+
+// Логин пользователя
+app.post('/auth/token', async (req, res) => {
+    const { username, password } = req.body;
+    
+    if (!username || !password) {
+        return res.status(400).json({ error: 'Username and password required' });
+    }
+    
+    // Простая проверка логинов без БД (fallback)
+    const users = {
+        'admin': { password: 'admin123', role: 'ADMIN', cameras: [] },
+        'operator': { password: 'op123', role: 'OPERATOR', cameras: [] },
+        'user1': { password: 'user123', role: 'USER', cameras: [1,2,3,4,5,6] },
+        'user2': { password: 'user123', role: 'USER', cameras: [7,8,9,10,11,12] },
+        'user3': { password: 'user123', role: 'USER', cameras: [13,14,15,16,17,18] },
+        'user4': { password: 'user123', role: 'USER', cameras: [19,20,21,22,23,24] }
+    };
+    
+    const user = users[username];
+    if (!user || user.password !== password) {
+        return res.status(401).json({ error: 'Invalid credentials' });
+    }
+    
+    // Генерируем JWT токен
+    const token = jwt.sign({
+        id: Math.floor(Math.random() * 1000),
+        username: username,
+        role: user.role,
+        cameras: user.cameras,
+        iat: Math.floor(Date.now() / 1000)
+    }, JWT_SECRET, { expiresIn: '24h' });
+    
+    res.json({
+        success: true,
+        token: token,
+        user: {
+            username: username,
+            role: user.role,
+            cameras: user.cameras
+        }
+    });
+});
+
+// Проверка токена
+app.get('/auth/validate', verifyToken, (req, res) => {
+    res.json({
+        success: true,
+        user: req.user
+    });
+});
+
+// НОВЫЙ ENDPOINT: Алиас для /api/cameras/list для совместимости с frontend
+app.get('/api/cameras', async (req, res) => {
+    try {
+        // Проверяем API ключ
+        const apiKey = req.header('X-API-Key');
+        if (!await verifyApiKey(apiKey)) {
+            return res.status(401).json({ error: 'Invalid API key' });
+        }
+
+        let cameras = [];
+        
+        if (prismaReady) {
+            try {
+                const dbCameras = await prisma.camera.findMany({
+                    select: {
+                        id: true,
+                        channelId: true,
+                        name: true,
+                        position: true,
+                        isActive: true,
+                        status: true
+                    },
+                    orderBy: { position: 'asc' }
+                });
+                
+                cameras = dbCameras.map(cam => ({
+                    id: cam.id,
+                    channelId: cam.channelId,
+                    name: cam.name || `Камера ${cam.channelId}`,
+                    position: cam.position,
+                    isActive: cam.isActive,
+                    status: cam.status?.toLowerCase() || 'offline',
+                    adaptiveHls: true
+                }));
+                
+            } catch (dbError) {
+                console.error('Database error, using fallback:', dbError.message);
+                cameras = getFallbackCameras();
+            }
+        } else {
+            cameras = getFallbackCameras();
+        }
+        
+        res.json({
+            success: true,
+            cameras,
+            total: cameras.length,
+            database_mode: prismaReady ? 'connected' : 'fallback'
+        });
+        
+    } catch (error) {
+        console.error('Error fetching cameras:', error);
+        res.status(500).json({
+            success: false,
+            error: 'Internal server error'
+        });
+    }
+});
+
+// Получение списка камер (с fallback без БД) - ОРИГИНАЛЬНЫЙ ENDPOINT
+app.get('/api/cameras/list', requireApiKey, async (req, res) => {
     try {
         let cameras = [];
         
         if (prismaReady) {
             // Используем БД если доступна
-            const dbCameras = await prisma.camera.findMany({
-                where: { isActive: true },
-                select: {
-                    id: true,
-                    channelId: true,
-                    name: true,
-                    position: true,
-                    isActive: true
-                },
-                orderBy: { channelId: 'asc' }
-            });
-            cameras = dbCameras;
+            try {
+                const dbCameras = await prisma.camera.findMany({
+                    where: { isActive: true },
+                    select: {
+                        id: true,
+                        channelId: true,
+                        name: true,
+                        position: true,
+                        isActive: true
+                    },
+                    orderBy: { channelId: 'asc' }
+                });
+                cameras = dbCameras;
+            } catch (dbError) {
+                console.error('Error fetching cameras:', dbError);
+                cameras = getFallbackCameras();
+            }
         } else {
             // Fallback - генерируем 24 камеры
-            cameras = Array.from({length: 24}, (_, i) => ({
-                id: i + 1,
-                channelId: i + 1,
-                name: `Камера ${i + 1}`,
-                position: i + 1,
-                isActive: true
-            }));
+            cameras = getFallbackCameras();
         }
 
         // Проверяем статус камер по наличию HLS файлов
@@ -365,7 +486,7 @@ app.get('/api/cameras/list', verifyApiKey, async (req, res) => {
 });
 
 // Генерация stream токена для доступа к камерам
-app.post('/api/stream-token', verifyApiKey, async (req, res) => {
+app.post('/api/stream-token', requireApiKey, async (req, res) => {
     const { cameraId, cameraIds, userId, duration, scope } = req.body;
 
     try {
@@ -486,7 +607,7 @@ app.post('/api/stream-token', verifyApiKey, async (req, res) => {
 });
 
 // Проверка и получение информации о stream токене
-app.get('/api/stream-token/verify', verifyApiKey, (req, res) => {
+app.get('/api/stream-token/verify', requireApiKey, (req, res) => {
     const token = req.query.token || req.headers.authorization?.replace('Bearer ', '');
     
     if (!token) {
@@ -531,7 +652,7 @@ app.get('/api/stream-token/verify', verifyApiKey, (req, res) => {
 });
 
 // Получение ссылок на HLS потоки для камеры
-app.get('/api/camera/:cameraId/streams', verifyApiKey, async (req, res) => {
+app.get('/api/camera/:cameraId/streams', requireApiKey, async (req, res) => {
     const cameraId = parseInt(req.params.cameraId);
 
     if (cameraId < 1 || cameraId > 24) {
@@ -689,7 +810,7 @@ app.get('/stream/:cameraId/:segment', verifyStreamToken, (req, res) => {
 // ЗАПИСЬ ВИДЕО
 // ===============================
 
-app.post('/api/camera/:cameraId/start-recording', verifyApiKey, async (req, res) => {
+app.post('/api/camera/:cameraId/start-recording', requireApiKey, async (req, res) => {
     const cameraId = parseInt(req.params.cameraId);
     
     if (cameraId < 1 || cameraId > 24) {
@@ -751,7 +872,7 @@ app.post('/api/camera/:cameraId/start-recording', verifyApiKey, async (req, res)
     }
 });
 
-app.post('/api/camera/:cameraId/stop-recording', verifyApiKey, async (req, res) => {
+app.post('/api/camera/:cameraId/stop-recording', requireApiKey, async (req, res) => {
     const cameraId = parseInt(req.params.cameraId);
     
     const recording = activeRecordings.get(cameraId);
