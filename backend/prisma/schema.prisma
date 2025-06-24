@@ -1,5 +1,6 @@
 generator client {
-  provider = "prisma-client-js"
+  provider      = "prisma-client-js"
+  binaryTargets = ["native", "linux-musl-openssl-3.0.x"]
 }
 
 datasource db {
@@ -7,87 +8,90 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-model Camera {
-  id         Int      @id @default(autoincrement())
-  channelId  Int      @unique @map("channel_id")
-  name       String   @default("")
-  password   String
-  position   Int      @default(0)
-  rtspUrl    String   @map("rtsp_url")
-  status     CameraStatus @default(OFFLINE)
-  isActive   Boolean  @default(true) @map("is_active")
-  createdAt  DateTime @default(now()) @map("created_at")
-  updatedAt  DateTime @updatedAt @map("updated_at")
-
-  recordings Recording[]
-  permissions UserCameraPermission[]
-
-  @@map("cameras")
-}
-
-model Recording {
-  id        Int      @id @default(autoincrement())
-  cameraId  Int      @map("camera_id")
-  filename  String   @unique
-  duration  Int      @default(0)
-  fileSize  BigInt   @default(0) @map("file_size")
-  startedBy String?  @map("started_by")
-  startedAt DateTime @default(now()) @map("started_at")
-  endedAt   DateTime? @map("ended_at")
-  
-  camera    Camera   @relation(fields: [cameraId], references: [id], onDelete: Cascade)
-
-  @@map("recordings")
-}
-
-model ApiKey {
-  id          Int      @id @default(autoincrement())
-  keyHash     String   @unique @map("key_hash")
-  serviceName String   @map("service_name")
-  permissions Json     @default("{}")
-  isActive    Boolean  @default(true) @map("is_active")
-  expiresAt   DateTime? @map("expires_at")
-  createdAt   DateTime @default(now()) @map("created_at")
-  lastUsedAt  DateTime? @map("last_used_at")
-
-  @@map("api_keys")
-}
-
 model User {
-  id       Int    @id @default(autoincrement())
-  username String @unique
-  role     UserRole @default(USER)
-  isActive Boolean @default(true) @map("is_active")
-  createdAt DateTime @default(now()) @map("created_at")
+  id        Int      @id @default(autoincrement())
+  username  String   @unique
+  password  String
+  role      UserRole @default(USER)
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
 
-  permissions UserCameraPermission[]
+  cameras   UserCamera[]
+  recordings Recording[]
 
   @@map("users")
 }
 
-model UserCameraPermission {
+model Camera {
+  id        Int     @id @default(autoincrement())
+  channelId Int     @unique
+  name      String
+  position  Int?
+  rtspUrl   String
+  isActive  Boolean @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  users      UserCamera[]
+  recordings Recording[]
+
+  @@map("cameras")
+}
+
+model UserCamera {
   id       Int @id @default(autoincrement())
-  userId   Int @map("user_id")
-  cameraId Int @map("camera_id")
-  canView  Boolean @default(true) @map("can_view")
-  canRecord Boolean @default(false) @map("can_record")
+  userId   Int
+  cameraId Int
 
   user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
   camera Camera @relation(fields: [cameraId], references: [id], onDelete: Cascade)
 
   @@unique([userId, cameraId])
-  @@map("user_camera_permissions")
+  @@map("user_cameras")
 }
 
-enum CameraStatus {
-  ONLINE
-  OFFLINE
-  ERROR
-  MAINTENANCE
+model ApiKey {
+  id          Int      @id @default(autoincrement())
+  name        String
+  key         String   @unique
+  description String?
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@map("api_keys")
+}
+
+model Recording {
+  id        Int             @id @default(autoincrement())
+  filename  String
+  filePath  String
+  cameraId  Int
+  userId    Int?
+  status    RecordingStatus @default(IN_PROGRESS)
+  startTime DateTime
+  endTime   DateTime?
+  fileSize  BigInt?
+  duration  Int?
+  createdAt DateTime        @default(now())
+  updatedAt DateTime        @updatedAt
+
+  camera Camera @relation(fields: [cameraId], references: [id])
+  user   User?  @relation(fields: [userId], references: [id])
+
+  @@map("recordings")
 }
 
 enum UserRole {
   ADMIN
-  OPERATOR  
+  OPERATOR
   USER
+}
+
+enum RecordingStatus {
+  IN_PROGRESS
+  COMPLETED
+  FAILED
+  DELETED
 }
